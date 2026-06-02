@@ -1,10 +1,18 @@
 import hashlib
+import uuid
+from collections import defaultdict
 
 import streamlit as st
 import pandas as pd
 from streamlit_gsheets import GSheetsConnection
 
 from cards import CLUBS, SPECIAL_SETS, card_label
+
+
+@st.cache_resource
+def _get_session_store() -> dict:
+    """Server-side store: {token: username}. Przetrwa reruns i refreshe."""
+    return {}
 
 
 def hash_pin(pin: str) -> str:
@@ -88,9 +96,10 @@ SPECIAL_CHOICES = {
 }
 
 
-def picker(key_prefix: str) -> list[str]:
-    """Widget wyboru kart pogrupowany po klubach i zestawach specjalnych."""
+def picker(key_prefix: str) -> tuple[list[str], set[str]]:
+    """Widget wyboru kart. Zwraca (wybrane karty, zbiór edytowanych prefixów klubów/setów)."""
     chosen: list[str] = []
+    edited_prefixes: set[str] = set()
 
     club_labels = st.multiselect(
         "Wybierz kluby",
@@ -100,6 +109,7 @@ def picker(key_prefix: str) -> list[str]:
     )
     for club_label_text in club_labels:
         code = CLUB_CHOICES[club_label_text]
+        edited_prefixes.add(code)
         opts = [f"{code}{i}" for i in range(1, 19)]
         picked = st.multiselect(
             f"{code} — numery (1–18)",
@@ -118,9 +128,21 @@ def picker(key_prefix: str) -> list[str]:
                 key=f"{key_prefix}_{code}",
                 placeholder="Wybierz numery...",
             )
+            if picked:
+                edited_prefixes.add(code)
             chosen.extend(picked)
 
-    return chosen
+    return chosen, edited_prefixes
+
+
+def merge_cards(saved: list[str], new: list[str], edited_prefixes: set[str]) -> list[str]:
+    """Połącz stare karty z nowymi — nadpisz tylko edytowane kluby/sety."""
+    if not edited_prefixes:
+        return saved
+    # Zachowaj stare karty z niedotkniętych prefixów
+    kept = [c for c in saved if not any(c.startswith(p) for p in edited_prefixes)]
+    # Dodaj nowe z edytowanych prefixów
+    return sorted(set(kept + new))
 
 
 KLASY = [f"{r}{l}" for r in range(1, 9) for l in "abc"]
@@ -141,13 +163,61 @@ else:
     existing_ids = []
 user_options = ["— Nowy użytkownik —"] + existing_ids
 
-st.header("1. Wprowadź swoje dane")
+# Odtwórz sesję z query_params po refreshu
+_sessions = _get_session_store()
+_qp = st.query_params
+_session_token = _qp.get("s", "")
+_remembered_user = _sessions.get(_session_token, "") if _session_token else ""
 
-wybor = st.selectbox("Wybierz siebie z listy lub dodaj się jako nowy:", options=user_options, key="user_select")
+_header_col, _logout_col = st.columns([4, 1])
+with _header_col:
+    st.header("1. Wprowadź swoje dane")
+with _logout_col:
+    if _remembered_user:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔓 Wyloguj", key="logout_btn"):
+            _sessions.pop(_session_token, None)
+            st.query_params.clear()
+            # Wyczyść dane użytkownika z session state
+            st.session_state["user_name"] = ""
+            st.session_state["user_phone"] = ""
+            st.session_state["_loaded_user"] = ""
+            st.session_state["user_select"] = "— Nowy użytkownik —"
+            # Wyczyść pickery
+            for key in list(st.session_state.keys()):
+                if key.startswith("need_") or key.startswith("have_"):
+                    del st.session_state[key]
+            st.rerun()
+
+# Jeśli zapamiętany user istnieje — ustaw go jako domyślny w selectbox
+default_idx = 0
+if _remembered_user and _remembered_user in user_options:
+    default_idx = user_options.index(_remembered_user)
+
+wybor = st.selectbox("Wybierz siebie z listy lub dodaj się jako nowy:", options=user_options, index=default_idx, key="user_select")
 
 # Wczytaj dane jeśli wybrano istniejącego użytkownika
 loaded_user = {}
 is_existing = wybor != "— Nowy użytkownik —"
+
+# Wyczyść pola formularza jeśli user zmienił wybór
+_prev_loaded = st.session_state.get("_loaded_user", "")
+if _prev_loaded and _prev_loaded != wybor:
+    # Wyczyść dane poprzedniego usera
+    st.session_state["user_name"] = ""
+    st.session_state["user_phone"] = ""
+    st.session_state["_loaded_user"] = ""
+    for key in list(st.session_state.keys()):
+        if key.startswith("need_") or key.startswith("have_"):
+            del st.session_state[key]
+
+# Wyczyść sesję jeśli user zmienił wybór
+if _remembered_user and _remembered_user != wybor:
+    _sessions.pop(_session_token, None)
+    st.query_params.clear()
+    _remembered_user = ""
+    _session_token = ""
+
 if is_existing:
     row = existing[existing["user"] == wybor].iloc[0]
     _name = str(row["user"])
@@ -164,21 +234,38 @@ if is_existing:
 # Dla istniejących: najpierw PIN, potem reszta
 # Dla nowych: wszystko od razu
 if is_existing:
-    pin = st.text_input("PIN (6 cyfr)", max_chars=6, type="password", key="user_pin")
+    saved_hash = loaded_user.get("pin_hash", "")
 
-    pin_ok = False
-    if pin and len(pin) == 6 and pin.isdigit():
-        saved_hash = loaded_user.get("pin_hash", "")
-        if saved_hash and saved_hash != "nan" and saved_hash == hash_pin(pin):
-            pin_ok = True
-            loaded_user["potrzebne"] = parse_cards(row.get("potrzebne", ""))
-            loaded_user["powtorki"] = parse_cards(row.get("powtorki", ""))
-        else:
-            st.warning("🔒 Błędny PIN.")
-            st.stop()
+    # Sprawdź czy mamy ważną sesję z query_params (po refreshu)
+    auto_login = (
+        _remembered_user == wybor
+        and bool(_session_token)
+    )
+
+    if auto_login:
+        pin_ok = True
+        loaded_user["potrzebne"] = parse_cards(row.get("potrzebne", ""))
+        loaded_user["powtorki"] = parse_cards(row.get("powtorki", ""))
     else:
-        st.info("🔑 Podaj swój 6-cyfrowy PIN, żeby wczytać i edytować swoje karty.")
-        st.stop()
+        pin = st.text_input("PIN (6 cyfr)", max_chars=6, type="password", key="user_pin")
+
+        pin_ok = False
+        if pin and len(pin) == 6 and pin.isdigit():
+            if saved_hash and saved_hash != "nan" and saved_hash == hash_pin(pin):
+                pin_ok = True
+                loaded_user["potrzebne"] = parse_cards(row.get("potrzebne", ""))
+                loaded_user["powtorki"] = parse_cards(row.get("powtorki", ""))
+                # Zapamiętaj sesję w URL (losowy token, nie hash)
+                _new_token = str(uuid.uuid4())
+                _sessions[_new_token] = wybor
+                st.query_params["s"] = _new_token
+                st.rerun()
+            else:
+                st.warning("🔒 Błędny PIN.")
+                st.stop()
+        else:
+            st.info("🔑 Podaj swój 6-cyfrowy PIN, żeby wczytać i edytować swoje karty.")
+            st.stop()
 
     # PIN OK — pokaż dane do edycji
     # Wymuś wartości w session state (nadpisuje puste z pierwszego renderu)
@@ -186,6 +273,30 @@ if is_existing:
         st.session_state["user_name"] = loaded_user.get("imie", "")
         st.session_state["user_phone"] = loaded_user.get("telefon", "")
         st.session_state["_loaded_user"] = wybor
+
+        # Załaduj zapisane karty do pickerów
+        for prefix, cards in [("need", loaded_user.get("potrzebne", [])), ("have", loaded_user.get("powtorki", []))]:
+            # Pogrupuj karty po prefiksie klubu/setu
+            by_prefix = defaultdict(list)
+            all_codes = set(CLUBS.keys()) | set(SPECIAL_SETS.keys())
+            for card in cards:
+                for code in sorted(all_codes, key=len, reverse=True):
+                    if card.startswith(code):
+                        by_prefix[code].append(card)
+                        break
+
+            # Ustaw kluby w multiselect
+            club_labels = []
+            for code in by_prefix:
+                if code in CLUBS:
+                    label = f"{code} — {CLUBS[code]} (18 kart)"
+                    club_labels.append(label)
+            if club_labels:
+                st.session_state[f"{prefix}_clubs"] = club_labels
+
+            # Ustaw numery kart per klub/set
+            for code, code_cards in by_prefix.items():
+                st.session_state[f"{prefix}_{code}"] = sorted(code_cards)
 
     col_name, col_class, col_phone = st.columns([3, 1, 2])
     with col_name:
@@ -240,23 +351,22 @@ with col1:
     st.subheader("🔎 Brakujące karty (Czego szukasz?)")
     saved_potrzebne = loaded_user.get("potrzebne", [])
     if saved_potrzebne:
-        st.caption(f"Zapisane ({len(saved_potrzebne)}): {', '.join(saved_potrzebne)}")
+        st.caption(f"Zapisane ({len(saved_potrzebne)}): {', '.join(sorted(saved_potrzebne))}")
     st.caption("Dodaj/zmień karty poniżej:")
-    nowe_potrzebne = picker("need")
-    # Jeśli user nie wybrał nic nowego, zachowaj stare
-    potrzebne = nowe_potrzebne if nowe_potrzebne else saved_potrzebne
+    nowe_potrzebne, edited_need = picker("need")
+    potrzebne = merge_cards(saved_potrzebne, nowe_potrzebne, edited_need)
 
 with col2:
     st.subheader("🔁 Powtórki (Co masz na oddanie?)")
     saved_powtorki = loaded_user.get("powtorki", [])
     if saved_powtorki:
-        st.caption(f"Zapisane ({len(saved_powtorki)}): {', '.join(saved_powtorki)}")
+        st.caption(f"Zapisane ({len(saved_powtorki)}): {', '.join(sorted(saved_powtorki))}")
     st.caption("Dodaj/zmień karty poniżej:")
-    nowe_powtorki = picker("have")
-    powtorki = nowe_powtorki if nowe_powtorki else saved_powtorki
+    nowe_powtorki, edited_have = picker("have")
+    powtorki = merge_cards(saved_powtorki, nowe_powtorki, edited_have)
 
 # Pokaż przycisk tylko jeśli zmieniono karty
-karty_zmienione = bool(nowe_potrzebne) or bool(nowe_powtorki)
+karty_zmienione = bool(edited_need) or bool(edited_have)
 if karty_zmienione:
     _, col_btn, _ = st.columns([1, 2, 1])
     with col_btn:
