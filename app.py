@@ -97,40 +97,39 @@ SPECIAL_CHOICES = {
 
 
 def picker(key_prefix: str) -> tuple[list[str], set[str]]:
-    """Widget wyboru kart. Zwraca (wybrane karty, zbiór edytowanych prefixów klubów/setów)."""
+    """Widget wyboru kart. Zwraca (wybrane karty, zbiór edytowanych prefixów klubów/setów).
+
+    Każdy klub i zestaw specjalny renderowany jest jako osobny expander z multiselect numerów.
+    Brak globalnego selektora klubów (powodował problem z popoverem 'No results').
+    """
     chosen: list[str] = []
     edited_prefixes: set[str] = set()
 
-    club_labels = st.multiselect(
-        "Wybierz kluby",
-        options=list(CLUB_CHOICES.keys()),
-        key=f"{key_prefix}_clubs",
-        placeholder="Wybierz...",
-    )
-    for club_label_text in club_labels:
-        code = CLUB_CHOICES[club_label_text]
-        edited_prefixes.add(code)
-        opts = [f"{code}{i}" for i in range(1, 19)]
-        picked = st.multiselect(
-            f"{code} — numery (1–18)",
-            options=opts,
-            key=f"{key_prefix}_{code}",
-            placeholder="Wybierz numery...",
-        )
-        chosen.extend(picked)
-
-    with st.expander("Zestawy specjalne (Gold, FWC, Jewel, Fans)"):
-        for label_text, (code, count) in SPECIAL_CHOICES.items():
-            opts = [f"{code}{i}" for i in range(1, count + 1)]
+    with st.expander("⚽ Kluby", expanded=True):
+        for code, name in CLUBS.items():
+            opts = [f"{code}{i}" for i in range(1, 19)]
             picked = st.multiselect(
-                label_text,
+                f"{code} — {name} (1–18)",
                 options=opts,
                 key=f"{key_prefix}_{code}",
                 placeholder="Wybierz numery...",
             )
             if picked:
                 edited_prefixes.add(code)
-            chosen.extend(picked)
+                chosen.extend(picked)
+
+    with st.expander("✨ Zestawy specjalne (Gold, FWC, Jewel, Fans)"):
+        for code, (name, count) in SPECIAL_SETS.items():
+            opts = [f"{code}{i}" for i in range(1, count + 1)]
+            picked = st.multiselect(
+                f"{code} — {name} ({count} kart)",
+                options=opts,
+                key=f"{key_prefix}_{code}",
+                placeholder="Wybierz numery...",
+            )
+            if picked:
+                edited_prefixes.add(code)
+                chosen.extend(picked)
 
     return chosen, edited_prefixes
 
@@ -161,13 +160,19 @@ if not existing.empty:
     existing_ids = sorted(existing["user"].tolist())
 else:
     existing_ids = []
-user_options = ["— Nowy użytkownik —"] + existing_ids
 
-# Odtwórz sesję z query_params po refreshu
+# Odtwórz sesję z query_params po refreshu (wcześniej, żeby dodać usera do opcji jeśli sheet jest stale)
 _sessions = _get_session_store()
 _qp = st.query_params
 _session_token = _qp.get("s", "")
 _remembered_user = _sessions.get(_session_token, "") if _session_token else ""
+
+# Jeśli zapamiętany user (z sesji) nie jest jeszcze w świeżo odczytanym arkuszu
+# (np. tuż po zapisie — gsheets bywa eventually-consistent), wymuś jego obecność w liście.
+if _remembered_user and _remembered_user not in existing_ids:
+    existing_ids.append(_remembered_user)
+    existing_ids.sort()
+user_options = ["— Nowy użytkownik —"] + existing_ids
 
 _header_col, _logout_col = st.columns([4, 1])
 with _header_col:
@@ -191,7 +196,13 @@ with _logout_col:
 
 # Jeśli zapamiętany user istnieje — ustaw go jako domyślny w selectbox
 default_idx = 0
-if _remembered_user and _remembered_user in user_options:
+
+# Po zapisie: ustaw selectbox na nowego usera (przed renderowaniem widgeta)
+_pending_user = st.session_state.pop("_pending_user_select", None)
+if _pending_user and _pending_user in user_options:
+    st.session_state["user_select"] = _pending_user
+    default_idx = user_options.index(_pending_user)
+elif _remembered_user and _remembered_user in user_options:
     default_idx = user_options.index(_remembered_user)
 
 wybor = st.selectbox("Wybierz siebie z listy lub dodaj się jako nowy:", options=user_options, index=default_idx, key="user_select")
@@ -219,17 +230,35 @@ if _remembered_user and _remembered_user != wybor:
     _session_token = ""
 
 if is_existing:
-    row = existing[existing["user"] == wybor].iloc[0]
-    _name = str(row["user"])
-    _klasa = str(row.get("klasa", "1a"))
-    _telefon = str(row.get("telefon", ""))
-    loaded_user = {
-        "user": _name,
-        "imie": _name.rsplit(" (", 1)[0] if " (" in _name else _name,
-        "klasa": _klasa,
-        "telefon": _telefon if _telefon != "nan" else "",
-        "pin_hash": str(row.get("pin_hash", "")),
-    }
+    row_match = existing[existing["user"] == wybor]
+    if row_match.empty:
+        # Wiersz jeszcze niewidoczny w arkuszu (stale read po zapisie) — użyj danych z session_state / flash.
+        # Fallback: spróbuj odtworzyć z poprzednio załadowanych danych.
+        row = None
+        _name = wybor
+        _klasa_default = st.session_state.get("user_class", "1a")
+        _klasa = _klasa_default if _klasa_default in KLASY else "1a"
+        _telefon = st.session_state.get("user_phone", "")
+        loaded_user = {
+            "user": _name,
+            "imie": _name.rsplit(" (", 1)[0] if " (" in _name else _name,
+            "klasa": _klasa,
+            "telefon": _telefon,
+            "pin_hash": st.session_state.get("_pin_hash_cached", ""),
+        }
+    else:
+        row = row_match.iloc[0]
+        _name = str(row["user"])
+        _klasa = str(row.get("klasa", "1a"))
+        _telefon = str(row.get("telefon", ""))
+        loaded_user = {
+            "user": _name,
+            "imie": _name.rsplit(" (", 1)[0] if " (" in _name else _name,
+            "klasa": _klasa,
+            "telefon": _telefon if _telefon != "nan" else "",
+            "pin_hash": str(row.get("pin_hash", "")),
+        }
+        st.session_state["_pin_hash_cached"] = loaded_user["pin_hash"]
 
 # Dla istniejących: najpierw PIN, potem reszta
 # Dla nowych: wszystko od razu
@@ -244,8 +273,15 @@ if is_existing:
 
     if auto_login:
         pin_ok = True
-        loaded_user["potrzebne"] = parse_cards(row.get("potrzebne", ""))
-        loaded_user["powtorki"] = parse_cards(row.get("powtorki", ""))
+        if row is not None:
+            loaded_user["potrzebne"] = parse_cards(row.get("potrzebne", ""))
+            loaded_user["powtorki"] = parse_cards(row.get("powtorki", ""))
+            st.session_state["_potrzebne_cached"] = loaded_user["potrzebne"]
+            st.session_state["_powtorki_cached"] = loaded_user["powtorki"]
+        else:
+            # Stale read — użyj ostatnio załadowanych danych z session_state.
+            loaded_user["potrzebne"] = st.session_state.get("_potrzebne_cached", [])
+            loaded_user["powtorki"] = st.session_state.get("_powtorki_cached", [])
     else:
         pin = st.text_input("PIN (6 cyfr)", max_chars=6, type="password", key="user_pin")
 
@@ -253,8 +289,10 @@ if is_existing:
         if pin and len(pin) == 6 and pin.isdigit():
             if saved_hash and saved_hash != "nan" and saved_hash == hash_pin(pin):
                 pin_ok = True
-                loaded_user["potrzebne"] = parse_cards(row.get("potrzebne", ""))
-                loaded_user["powtorki"] = parse_cards(row.get("powtorki", ""))
+                loaded_user["potrzebne"] = parse_cards(row.get("potrzebne", "")) if row is not None else []
+                loaded_user["powtorki"] = parse_cards(row.get("powtorki", "")) if row is not None else []
+                st.session_state["_potrzebne_cached"] = loaded_user["potrzebne"]
+                st.session_state["_powtorki_cached"] = loaded_user["powtorki"]
                 # Zapamiętaj sesję w URL (losowy token, nie hash)
                 _new_token = str(uuid.uuid4())
                 _sessions[_new_token] = wybor
@@ -284,15 +322,6 @@ if is_existing:
                     if card.startswith(code):
                         by_prefix[code].append(card)
                         break
-
-            # Ustaw kluby w multiselect
-            club_labels = []
-            for code in by_prefix:
-                if code in CLUBS:
-                    label = f"{code} — {CLUBS[code]} (18 kart)"
-                    club_labels.append(label)
-            if club_labels:
-                st.session_state[f"{prefix}_clubs"] = club_labels
 
             # Ustaw numery kart per klub/set
             for code, code_cards in by_prefix.items():
@@ -350,18 +379,12 @@ col1, col2 = st.columns(2)
 with col1:
     st.subheader("🔎 Brakujące karty (Czego szukasz?)")
     saved_potrzebne = loaded_user.get("potrzebne", [])
-    if saved_potrzebne:
-        st.caption(f"Zapisane ({len(saved_potrzebne)}): {', '.join(sorted(saved_potrzebne))}")
-    st.caption("Dodaj/zmień karty poniżej:")
     nowe_potrzebne, edited_need = picker("need")
     potrzebne = merge_cards(saved_potrzebne, nowe_potrzebne, edited_need)
 
 with col2:
     st.subheader("🔁 Powtórki (Co masz na oddanie?)")
     saved_powtorki = loaded_user.get("powtorki", [])
-    if saved_powtorki:
-        st.caption(f"Zapisane ({len(saved_powtorki)}): {', '.join(sorted(saved_powtorki))}")
-    st.caption("Dodaj/zmień karty poniżej:")
     nowe_powtorki, edited_have = picker("have")
     powtorki = merge_cards(saved_powtorki, nowe_powtorki, edited_have)
 
@@ -371,8 +394,17 @@ if karty_zmienione:
     _, col_btn, _ = st.columns([1, 2, 1])
     with col_btn:
         save_clicked = st.button("Zapisz moje karty ✨", type="primary", width="stretch")
+        # Pokaż komunikat sukcesu tuż pod przyciskiem (po rerun)
+        _flash = st.session_state.pop("_flash_success", None)
+        if _flash:
+            st.success(_flash)
+            st.toast(_flash, icon="✨")
 else:
     save_clicked = False
+    # Obsłuż flash również gdy przycisk jest ukryty (edge case)
+    _flash = st.session_state.pop("_flash_success", None)
+    if _flash:
+        st.toast(_flash, icon="✨")
 
 if save_clicked:
     # Dla istniejących użytkowników PIN jest już zweryfikowany (pin_ok=True),
@@ -422,8 +454,40 @@ if save_clicked:
             "powtorki": ",".join(sorted(set(powtorki))),
             "pin_hash": pin_hash_to_save,
         }])
+        # Jeśli zmieniono imię/klasę istniejącego użytkownika — usuń stary wpis pod poprzednią nazwą
+        if is_existing and wybor and wybor != user:
+            df = df[df["user"] != wybor]
+
         df = pd.concat([df, new_row], ignore_index=True)
         save_data(df)
+
+        # Wymuś inwalidację cache gsheets, żeby następny load_data() zobaczył świeże dane.
+        try:
+            conn.reset()
+        except Exception:
+            pass
+
+        # Zapamiętaj świeżo zapisane dane w session_state — fallback gdyby kolejny read
+        # był jeszcze stale (gsheets bywa eventually-consistent).
+        st.session_state["_potrzebne_cached"] = sorted(set(potrzebne))
+        st.session_state["_powtorki_cached"] = sorted(set(powtorki))
+        st.session_state["_pin_hash_cached"] = pin_hash_to_save
+        # Token zapisany w URL musi wskazywać aktualny `user`, a selectbox musi go pokazywać.
+        if is_existing:
+            if _session_token:
+                _sessions[_session_token] = user
+            else:
+                _new_token = str(uuid.uuid4())
+                _sessions[_new_token] = user
+                st.query_params["s"] = _new_token
+        else:
+            # Nowy użytkownik — załóż sesję, żeby od razu był zalogowany
+            _new_token = str(uuid.uuid4())
+            _sessions[_new_token] = user
+            st.query_params["s"] = _new_token
+
+        st.session_state["_pending_user_select"] = user
+        st.session_state["_loaded_user"] = user
 
         def _kart(n: int) -> str:
             if n == 1:
@@ -432,7 +496,10 @@ if save_clicked:
                 return f"{n} karty"
             return f"{n} kart"
 
-        st.success(f"Zapisano! Szukasz: {_kart(len(potrzebne))}, oddasz: {_kart(len(powtorki))}.")
+        st.session_state["_flash_success"] = (
+            f"Zapisano! Szukasz: {_kart(len(potrzebne))}, oddasz: {_kart(len(powtorki))}."
+        )
+        st.rerun()
 
 st.divider()
 
