@@ -80,6 +80,11 @@ def load_data() -> pd.DataFrame:
             return pd.DataFrame(columns=COLUMNS)
         # Odfiltruj puste wiersze
         df = df.dropna(subset=["user"])
+        # Telefon bywa wczytywany jako float (np. 733404212.0) — wymuś string bez .0
+        if "telefon" in df.columns:
+            df["telefon"] = df["telefon"].apply(
+                lambda v: str(int(v)) if isinstance(v, float) and not pd.isna(v) else str(v) if pd.notna(v) else ""
+            )
         return df[COLUMNS]
     except Exception:
         return pd.DataFrame(columns=COLUMNS)
@@ -88,6 +93,47 @@ def load_data() -> pd.DataFrame:
 def save_data(df: pd.DataFrame) -> None:
     """Zapisz DataFrame do arkusza 'Dane'."""
     conn.update(worksheet="Dane", data=df)
+
+
+def _render_legenda():
+    with st.expander("ℹ️ Legenda kodów"):
+        st.write("**Kluby (18 kart każdy, kod1–kod18):**")
+        st.write(" • ".join(f"`{c}` {n}" for c, n in CLUBS.items()))
+        st.write("**Zestawy specjalne:**")
+        for code, (name, count) in SPECIAL_SETS.items():
+            st.write(f"- `{code}1`–`{code}{count}` — {name}")
+
+
+def _render_jak_korzystac():
+    with st.expander("📖 Jak korzystać z aplikacji?"):
+        st.markdown("""
+**1. Rejestracja (nowy użytkownik)**
+- Wybierz **„— Nowy użytkownik —”** z listy na górze.
+- Wpisz swoje **imię**, wybierz **klasę**, podaj **numer telefonu/WhatsApp** i ustaw **6-cyfrowy PIN**.
+- PIN będzie potrzebny przy każdym logowaniu — zapamiętaj go!
+
+**2. Logowanie (istniejący użytkownik)**
+- Wybierz swoje imię z listy na górze.
+- Wpisz swój **6-cyfrowy PIN**, żeby odblokować edycję kart.
+
+**3. Dodawanie kart**
+- W sekcji **🔎 Brakujące karty** — dodaj karty, których szukasz.
+- W sekcji **🔁 Powtórki** — dodaj karty, które masz na wymianę.
+- Najpierw wybierz klub (np. BAR — FC Barcelona), a potem konkretne numery kart.
+- Zestawy specjalne (Gold, FWC, Jewel, Fans) znajdziesz w osobnym rozwijalnym panelu.
+- Kliknij **„Zapisz moje karty/profil ✨”**, żeby zapisać zmiany.
+
+**4. Propozycje wymian**
+- Po zapisaniu kart, na dole strony pojawią się **propozycje wymian** z innymi graczami.
+- 🔄 **Wymiana obustronna** — obie strony mają coś do wymiany (najlepsze!).
+- 📥 **Możesz dostać** — ktoś ma kartę, której szukasz.
+- 📤 **Możesz oddać** — masz kartę, której ktoś szuka.
+- Skontaktuj się przez **WhatsApp**, żeby umówić wymianę!
+
+**5. Kody kart**
+- Każda karta ma kod: np. `BAR5` = FC Barcelona, karta nr 5.
+- Kody znajdziesz w sekcji **ℹ️ Legenda kodów** powyżej.
+""")
 
 CLUB_CHOICES = {f"{code} — {name} (18 kart)": code for code, name in CLUBS.items()}
 SPECIAL_CHOICES = {
@@ -174,13 +220,13 @@ if _remembered_user and _remembered_user not in existing_ids:
     existing_ids.sort()
 user_options = ["— Nowy użytkownik —"] + existing_ids
 
-_header_col, _logout_col = st.columns([4, 1])
+_header_col, _logout_col = st.columns([8, 1])
 with _header_col:
     st.header("1. Wprowadź swoje dane")
 with _logout_col:
     if _remembered_user:
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🔓 Wyloguj", key="logout_btn"):
+        if st.button("🔓 Wyloguj", key="logout_btn", width="stretch"):
             _sessions.pop(_session_token, None)
             st.query_params.clear()
             # Wyczyść dane użytkownika z session state
@@ -259,6 +305,13 @@ if is_existing:
             "pin_hash": str(row.get("pin_hash", "")),
         }
         st.session_state["_pin_hash_cached"] = loaded_user["pin_hash"]
+        # Nadpisz danymi z cache jeśli są świeższe (gsheets bywa eventually-consistent)
+        if "_telefon_cached" in st.session_state:
+            loaded_user["telefon"] = st.session_state.pop("_telefon_cached")
+        if "_imie_cached" in st.session_state:
+            loaded_user["imie"] = st.session_state.pop("_imie_cached")
+        if "_klasa_cached" in st.session_state:
+            loaded_user["klasa"] = st.session_state.pop("_klasa_cached")
 
 # Dla istniejących: najpierw PIN, potem reszta
 # Dla nowych: wszystko od razu
@@ -323,9 +376,11 @@ if is_existing:
                         by_prefix[code].append(card)
                         break
 
-            # Ustaw numery kart per klub/set
+            # Ustaw numery kart per klub/set (sortuj numerycznie po sufiksie)
             for code, code_cards in by_prefix.items():
-                st.session_state[f"{prefix}_{code}"] = sorted(code_cards)
+                st.session_state[f"{prefix}_{code}"] = sorted(
+                    code_cards, key=lambda c: int(c[len(code):]) if c[len(code):].isdigit() else 0
+                )
 
     col_name, col_class, col_phone = st.columns([3, 1, 2])
     with col_name:
@@ -372,28 +427,41 @@ if not is_existing and not imie:
         st.dataframe(podsumowanie, width="stretch", hide_index=True)
     else:
         st.info("Nikt jeszcze nie dodał swoich kart.")
+    _render_legenda()
+    _render_jak_korzystac()
     st.stop()
 
 # ---- Wyświetl zapisane karty + picker do edycji ----
 col1, col2 = st.columns(2)
 with col1:
-    st.subheader("🔎 Brakujące karty (Czego szukasz?)")
+    st.subheader("🔎  Brakujące karty (Czego szukasz)")
     saved_potrzebne = loaded_user.get("potrzebne", [])
     nowe_potrzebne, edited_need = picker("need")
     potrzebne = merge_cards(saved_potrzebne, nowe_potrzebne, edited_need)
 
 with col2:
-    st.subheader("🔁 Powtórki (Co masz na oddanie?)")
+    st.subheader("🔁  Powtórki (Co masz do oddania)")
     saved_powtorki = loaded_user.get("powtorki", [])
     nowe_powtorki, edited_have = picker("have")
     powtorki = merge_cards(saved_powtorki, nowe_powtorki, edited_have)
 
-# Pokaż przycisk tylko jeśli zmieniono karty
+# Pokaż przycisk jeśli zmieniono karty lub dane profilu (np. telefon)
 karty_zmienione = bool(edited_need) or bool(edited_have)
-if karty_zmienione:
+if is_existing:
+    profil_zmieniony = (
+        imie != loaded_user.get("imie", "")
+        or klasa != loaded_user.get("klasa", "1a")
+        or (telefon or "") != (loaded_user.get("telefon", "") or "")
+    )
+else:
+    # Dla nowego użytkownika sam formularz danych jest częścią zapisu.
+    profil_zmieniony = True
+
+mozna_zapisac = karty_zmienione or profil_zmieniony
+if mozna_zapisac:
     _, col_btn, _ = st.columns([1, 2, 1])
     with col_btn:
-        save_clicked = st.button("Zapisz moje karty ✨", type="primary", width="stretch")
+        save_clicked = st.button("Zapisz moje karty/profil ✨", type="primary", width="stretch")
         # Pokaż komunikat sukcesu tuż pod przyciskiem (po rerun)
         _flash = st.session_state.pop("_flash_success", None)
         if _flash:
@@ -472,6 +540,9 @@ if save_clicked:
         st.session_state["_potrzebne_cached"] = sorted(set(potrzebne))
         st.session_state["_powtorki_cached"] = sorted(set(powtorki))
         st.session_state["_pin_hash_cached"] = pin_hash_to_save
+        st.session_state["_telefon_cached"] = telefon
+        st.session_state["_imie_cached"] = imie
+        st.session_state["_klasa_cached"] = klasa
         # Token zapisany w URL musi wskazywać aktualny `user`, a selectbox musi go pokazywać.
         if is_existing:
             if _session_token:
@@ -489,16 +560,7 @@ if save_clicked:
         st.session_state["_pending_user_select"] = user
         st.session_state["_loaded_user"] = user
 
-        def _kart(n: int) -> str:
-            if n == 1:
-                return "1 kartę"
-            elif 2 <= n <= 4:
-                return f"{n} karty"
-            return f"{n} kart"
-
-        st.session_state["_flash_success"] = (
-            f"Zapisano! Szukasz: {_kart(len(potrzebne))}, oddasz: {_kart(len(powtorki))}."
-        )
+        st.session_state["_flash_success"] = "Zapisano!"
         st.rerun()
 
 st.divider()
@@ -588,39 +650,5 @@ if user:
 else:
     st.info("Wprowadź swoje dane, aby zobaczyć propozycje wymian.")
 
-with st.expander("ℹ️ Legenda kodów"):
-    st.write("**Kluby (18 kart każdy, kod1–kod18):**")
-    st.write(" • ".join(f"`{c}` {n}" for c, n in CLUBS.items()))
-    st.write("**Zestawy specjalne:**")
-    for code, (name, count) in SPECIAL_SETS.items():
-        st.write(f"- `{code}1`–`{code}{count}` — {name}")
-
-with st.expander("📖 Jak korzystać z aplikacji?"):
-    st.markdown("""
-**1. Rejestracja (nowy użytkownik)**
-- Wybierz **„— Nowy użytkownik —"** z listy na górze.
-- Wpisz swoje **imię**, wybierz **klasę**, podaj **numer telefonu/WhatsApp** i ustaw **6-cyfrowy PIN**.
-- PIN będzie potrzebny przy każdym logowaniu — zapamiętaj go!
-
-**2. Logowanie (istniejący użytkownik)**
-- Wybierz swoje imię z listy na górze.
-- Wpisz swój **6-cyfrowy PIN**, żeby odblokować edycję kart.
-
-**3. Dodawanie kart**
-- W sekcji **🔎 Brakujące karty** — dodaj karty, których szukasz.
-- W sekcji **🔁 Powtórki** — dodaj karty, które masz na wymianę.
-- Najpierw wybierz klub (np. BAR — FC Barcelona), a potem konkretne numery kart.
-- Zestawy specjalne (Gold, FWC, Jewel, Fans) znajdziesz w osobnym rozwijalnym panelu.
-- Kliknij **„Zapisz moje karty ✨"**, żeby zapisać zmiany.
-
-**4. Propozycje wymian**
-- Po zapisaniu kart, na dole strony pojawią się **propozycje wymian** z innymi graczami.
-- 🔄 **Wymiana obustronna** — obie strony mają coś do wymiany (najlepsze!).
-- 📥 **Możesz dostać** — ktoś ma kartę, której szukasz.
-- 📤 **Możesz oddać** — masz kartę, której ktoś szuka.
-- Skontaktuj się przez **WhatsApp**, żeby umówić wymianę!
-
-**5. Kody kart**
-- Każda karta ma kod: np. `BAR5` = FC Barcelona, karta nr 5.
-- Kody znajdziesz w sekcji **ℹ️ Legenda kodów** powyżej.
-""")
+_render_legenda()
+_render_jak_korzystac()
