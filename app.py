@@ -63,7 +63,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.image("banner.jpg", use_container_width=True)
+st.image("banner.jpg", width="stretch")
 st.title("⚽ System Wymiany Kart Panini FIFA 365 Adrenalyn XL 2026")
 
 # --------------- Google Sheets backend ---------------
@@ -340,7 +340,7 @@ if not is_existing and not imie:
             }
             for _, row in dane.iterrows()
         ])
-        st.dataframe(podsumowanie, use_container_width=True, hide_index=True)
+        st.dataframe(podsumowanie, width="stretch", hide_index=True)
     else:
         st.info("Nikt jeszcze nie dodał swoich kart.")
     st.stop()
@@ -370,14 +370,23 @@ karty_zmienione = bool(edited_need) or bool(edited_have)
 if karty_zmienione:
     _, col_btn, _ = st.columns([1, 2, 1])
     with col_btn:
-        save_clicked = st.button("Zapisz moje karty ✨", type="primary", use_container_width=True)
+        save_clicked = st.button("Zapisz moje karty ✨", type="primary", width="stretch")
 else:
     save_clicked = False
 
 if save_clicked:
+    # Dla istniejących użytkowników PIN jest już zweryfikowany (pin_ok=True),
+    # więc używamy hashu zapisanego na koncie. Dla nowych — bierzemy z formularza.
+    if is_existing and pin_ok:
+        pin_hash_to_save = loaded_user.get("pin_hash", "") or hash_pin(st.session_state.get("user_pin", ""))
+        pin_valid = True
+    else:
+        pin_valid = bool(pin) and len(pin) == 6 and pin.isdigit()
+        pin_hash_to_save = hash_pin(pin) if pin_valid else ""
+
     if not imie:
         st.error("Podaj swoje imię!")
-    elif not pin or len(pin) != 6 or not pin.isdigit():
+    elif not pin_valid:
         st.error("PIN musi mieć dokładnie 6 cyfr!")
     else:
         df = load_data()
@@ -397,10 +406,10 @@ if save_clicked:
             )
             st.stop()
 
-        if not existing_row.empty:
-            # Użytkownik istnieje — sprawdź PIN
+        if not existing_row.empty and not is_existing:
+            # Edycja przez nowy formularz — sprawdź PIN
             saved_hash = str(existing_row.iloc[0].get("pin_hash", ""))
-            if saved_hash and saved_hash != "nan" and saved_hash != hash_pin(pin):
+            if saved_hash and saved_hash != "nan" and saved_hash != pin_hash_to_save:
                 st.error("❌ Błędny PIN! Nie możesz edytować danych innego użytkownika.")
                 st.stop()
         # PIN OK lub nowy użytkownik
@@ -411,7 +420,7 @@ if save_clicked:
             "telefon": telefon,
             "potrzebne": ",".join(sorted(set(potrzebne))),
             "powtorki": ",".join(sorted(set(powtorki))),
-            "pin_hash": hash_pin(pin),
+            "pin_hash": pin_hash_to_save,
         }])
         df = pd.concat([df, new_row], ignore_index=True)
         save_data(df)
@@ -443,7 +452,7 @@ if not dane.empty:
         }
         for _, row in dane.iterrows()
     ])
-    st.dataframe(podsumowanie, use_container_width=True, hide_index=True)
+    st.dataframe(podsumowanie, width="stretch", hide_index=True)
 else:
     st.info("Nikt jeszcze nie dodał swoich kart.")
 
